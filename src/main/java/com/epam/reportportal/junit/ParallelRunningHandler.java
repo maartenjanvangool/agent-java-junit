@@ -15,7 +15,6 @@
  */
 package com.epam.reportportal.junit;
 
-import com.epam.reportportal.annotations.Tags;
 import com.epam.reportportal.annotations.UniqueID;
 import com.epam.reportportal.listeners.ListenerParameters;
 import com.epam.reportportal.listeners.Statuses;
@@ -25,19 +24,20 @@ import com.epam.ta.reportportal.ws.model.FinishExecutionRQ;
 import com.epam.ta.reportportal.ws.model.FinishTestItemRQ;
 import com.epam.ta.reportportal.ws.model.ParameterResource;
 import com.epam.ta.reportportal.ws.model.StartTestItemRQ;
+import com.epam.ta.reportportal.ws.model.attribute.ItemAttributesRQ;
 import com.epam.ta.reportportal.ws.model.issue.Issue;
 import com.epam.ta.reportportal.ws.model.launch.StartLaunchRQ;
 import com.epam.ta.reportportal.ws.model.log.SaveLogRQ;
-import com.google.common.collect.Sets;
 import com.google.inject.Inject;
 import com.nordstrom.automation.junit.ArtifactParams;
+import com.nordstrom.automation.junit.DisplayName;
 import com.nordstrom.automation.junit.LifecycleHooks;
 import com.nordstrom.automation.junit.RetriedTest;
 import io.reactivex.Maybe;
+import io.reactivex.annotations.Nullable;
+import org.apache.commons.lang3.reflect.MethodUtils;
 import org.junit.*;
-import org.junit.experimental.categories.Category;
 import org.junit.runners.Suite;
-import org.junit.runners.model.Annotatable;
 import org.junit.runners.model.FrameworkMethod;
 import org.junit.runners.model.TestClass;
 import rp.com.google.common.annotations.VisibleForTesting;
@@ -45,11 +45,10 @@ import rp.com.google.common.base.Function;
 import rp.com.google.common.base.Supplier;
 
 import java.io.Serializable;
+import java.lang.reflect.InvocationTargetException;
 import java.util.*;
 import java.util.Map.Entry;
-import java.util.stream.Collectors;
 
-import static rp.com.google.common.base.Optional.fromNullable;
 import static rp.com.google.common.base.Strings.isNullOrEmpty;
 import static rp.com.google.common.base.Throwables.getStackTraceAsString;
 
@@ -64,6 +63,7 @@ import static rp.com.google.common.base.Throwables.getStackTraceAsString;
 public class ParallelRunningHandler implements IListenerHandler {
 
 	public static final String API_BASE = "/reportportal-ws/api/v1";
+	private static final String SKIPPED_ISSUE_KEY = "skippedIssue";
 
 	private ParallelRunningContext context;
 	private MemoizingSupplier<Launch> launch;
@@ -179,9 +179,9 @@ public class ParallelRunningHandler implements IListenerHandler {
 	 */
 	@Override
 	public void sendReportPortalMsg(final FrameworkMethod method, Object runner, final Throwable thrown) {
-		Function<String, SaveLogRQ> function = itemId -> {
+		Function<String, SaveLogRQ> function = itemUuid -> {
 			SaveLogRQ rq = new SaveLogRQ();
-			rq.setTestItemId(itemId);
+			rq.setItemUuid(itemUuid);
 			rq.setLevel("ERROR");
 			rq.setLogTime(Calendar.getInstance().getTime());
 			if (thrown != null) {
@@ -207,7 +207,7 @@ public class ParallelRunningHandler implements IListenerHandler {
 	/**
 	 * Detect the type of the specified JUnit method.
 	 *
-	 * @param method {@FrameworkMethod} object
+	 * @param method {@code FrameworkMethod} object
 	 * @return method type string; empty string for unsupported types
 	 */
 	private String detectMethodType(FrameworkMethod method) {
@@ -250,8 +250,21 @@ public class ParallelRunningHandler implements IListenerHandler {
 		StartLaunchRQ rq = new StartLaunchRQ();
 		rq.setName(parameters.getLaunchName());
 		rq.setStartTime(Calendar.getInstance().getTime());
-		rq.setTags(parameters.getTags());
+		rq.setAttributes(parameters.getAttributes());
 		rq.setMode(parameters.getLaunchRunningMode());
+
+		Boolean skippedAnIssue = parameters.getSkippedAnIssue();
+		ItemAttributesRQ skippedIssueAttr = new ItemAttributesRQ();
+		skippedIssueAttr.setKey(SKIPPED_ISSUE_KEY);
+		skippedIssueAttr.setValue(skippedAnIssue == null ? "true" : skippedAnIssue.toString());
+		skippedIssueAttr.setSystem(true);
+		rq.getAttributes().add(skippedIssueAttr);
+
+		rq.setRerun(parameters.isRerun());
+		if (!isNullOrEmpty(parameters.getRerunOf())) {
+			rq.setRerunOf(parameters.getRerunOf());
+		}
+
 		if (!isNullOrEmpty(parameters.getDescription())) {
 			rq.setDescription(parameters.getDescription());
 		}
@@ -266,7 +279,8 @@ public class ParallelRunningHandler implements IListenerHandler {
 	 */
 	protected StartTestItemRQ buildStartSuiteRq(Object runner) {
 		StartTestItemRQ rq = new StartTestItemRQ();
-		rq.setName(getName(runner));
+		rq.setName(getRunnerName(runner));
+		rq.setCodeRef(getCodeRef(runner));
 		rq.setStartTime(Calendar.getInstance().getTime());
 		rq.setType("SUITE");
 		return rq;
@@ -280,10 +294,10 @@ public class ParallelRunningHandler implements IListenerHandler {
 	 */
 	protected StartTestItemRQ buildStartTestItemRq(Object runner) {
 		StartTestItemRQ rq = new StartTestItemRQ();
-		rq.setName(getName(runner));
+		rq.setName(getRunnerName(runner));
+		rq.setCodeRef(getCodeRef(runner));
 		rq.setStartTime(Calendar.getInstance().getTime());
 		rq.setType("TEST");
-		rq.setTags(getAnnotationTags(LifecycleHooks.getTestClassOf(runner)));
 		return rq;
 	}
 
@@ -296,42 +310,14 @@ public class ParallelRunningHandler implements IListenerHandler {
 	protected StartTestItemRQ buildStartStepRq(FrameworkMethod method) {
 		StartTestItemRQ rq = new StartTestItemRQ();
 		rq.setName(method.getName());
-
+		rq.setCodeRef(getCodeRef(method));
 		rq.setDescription(createStepDescription(method));
 		rq.setUniqueId(extractUniqueID(method));
 		rq.setStartTime(Calendar.getInstance().getTime());
 		rq.setType(detectMethodType(method));
-		rq.setTags(getAnnotationTags(method));
 
 		rq.setRetry(isRetry(method));
 		return rq;
-	}
-
-	/**
-	 * Returns a set of tags of the given annotated context. This method is looking for the following annotations in
-	 * this context:
-	 *
-	 * <ul>
-	 * <li>{@link Tags}</li>
-	 * <li>{@link Category}</li>
-	 * </ul>
-	 * <p>
-	 * If annotations are not present - this method returns empty set.
-	 *
-	 * @param context Context to extract tags
-	 * @return Set of tags of given annotated element
-	 */
-	@VisibleForTesting
-	static Set<String> getAnnotationTags(Annotatable context) {
-		Set<String> result = new HashSet<>();
-
-		Optional.ofNullable(context.getAnnotation(Category.class))
-				.map(category -> Arrays.stream(category.value()).map(Class::getSimpleName).collect(Collectors.toSet()))
-				.ifPresent(result::addAll);
-
-		Optional.ofNullable(context.getAnnotation(Tags.class)).map(tags -> Sets.newHashSet(tags.value())).ifPresent(result::addAll);
-
-		return result;
 	}
 
 	/**
@@ -371,7 +357,7 @@ public class ParallelRunningHandler implements IListenerHandler {
 		rq.setEndTime(Calendar.getInstance().getTime());
 		rq.setStatus((status == null || status.equals("")) ? Statuses.PASSED : status);
 		// Allows indicate that SKIPPED is not to investigate items for WS
-		if (Statuses.SKIPPED.equals(status) && !fromNullable(launch.get().getParameters().getSkippedAnIssue()).or(false)) {
+		if (Statuses.SKIPPED.equals(status) && !Optional.ofNullable(launch.get().getParameters().getSkippedAnIssue()).orElse(false)) {
 			Issue issue = new Issue();
 			issue.setIssueType("NOT_ISSUE");
 			rq.setIssue(issue);
@@ -407,7 +393,7 @@ public class ParallelRunningHandler implements IListenerHandler {
 		if (!(method.isStatic() || isIgnored(method))) {
 			Object target = LifecycleHooks.getTargetForRunner(runner);
 			if (target instanceof ArtifactParams) {
-				Optional<Map<String, Object>> params = ((ArtifactParams) target).getParameters();
+				com.google.common.base.Optional<Map<String, Object>> params = ((ArtifactParams) target).getParameters();
 				if (params.isPresent()) {
 					for (Entry<String, Object> param : params.get().entrySet()) {
 						ParameterResource parameter = new ParameterResource();
@@ -428,7 +414,8 @@ public class ParallelRunningHandler implements IListenerHandler {
 	 * @return Test/Step Description being sent to ReportPortal
 	 */
 	protected String createStepDescription(FrameworkMethod method) {
-		return method.getName();
+		DisplayName itemDisplayName = method.getAnnotation(DisplayName.class);
+		return (itemDisplayName != null) ? itemDisplayName.value() : getChildName(method);
 	}
 
 	/**
@@ -437,7 +424,7 @@ public class ParallelRunningHandler implements IListenerHandler {
 	 * @param method Where to find
 	 * @return test item ID or null
 	 */
-	private String extractUniqueID(FrameworkMethod method) {
+	private static String extractUniqueID(FrameworkMethod method) {
 		UniqueID itemUniqueID = method.getAnnotation(UniqueID.class);
 		return itemUniqueID != null ? itemUniqueID.value() : null;
 	}
@@ -448,7 +435,7 @@ public class ParallelRunningHandler implements IListenerHandler {
 	 * @param method JUnit framework method context
 	 * @return {@code true} if specified method is being ignored; otherwise {@code false}
 	 */
-	private boolean isIgnored(FrameworkMethod method) {
+	private static boolean isIgnored(FrameworkMethod method) {
 		return (null != method.getAnnotation(Ignore.class));
 	}
 
@@ -458,7 +445,7 @@ public class ParallelRunningHandler implements IListenerHandler {
 	 * @param method JUnit framework method context
 	 * @return {@code true} if specified method is being retried; otherwise {@code false}
 	 */
-	private boolean isRetry(FrameworkMethod method) {
+	private static boolean isRetry(FrameworkMethod method) {
 		return (null != method.getAnnotation(RetriedTest.class));
 	}
 
@@ -468,7 +455,7 @@ public class ParallelRunningHandler implements IListenerHandler {
 	 * @param runner JUnit test runner
 	 * @return name for runner
 	 */
-	private String getName(Object runner) {
+	private static String getRunnerName(Object runner) {
 		String name;
 		TestClass testClass = LifecycleHooks.getTestClassOf(runner);
 		Class<?> javaClass = testClass.getJavaClass();
@@ -480,6 +467,47 @@ public class ParallelRunningHandler implements IListenerHandler {
 			name = role + type + " Runner";
 		}
 		return name;
+	}
+
+	/**
+	 * Get code reference associated with the specified JUnit runner.
+	 *
+	 * @param runner JUnit test runner
+	 * @return code reference to the runner
+	 */
+	@Nullable
+	private String getCodeRef(Object runner) {
+		TestClass testClass = LifecycleHooks.getTestClassOf(runner);
+		Class<?> javaClass = testClass.getJavaClass();
+		if (javaClass != null) {
+			javaClass.getCanonicalName();
+		}
+		return null;
+	}
+
+	/**
+	 * Get code reference associated with the specified JUnit test method.
+	 *
+	 * @param frameworkMethod JUnit test method
+	 * @return code reference to the test method
+	 */
+	@Nullable
+	private String getCodeRef(FrameworkMethod frameworkMethod) {
+		return frameworkMethod.getDeclaringClass().getCanonicalName() + "." + frameworkMethod.getName();
+	}
+
+	/**
+	 * Get name of the specified JUnit child object.
+	 *
+	 * @param child JUnit child object
+	 * @return child object name
+	 */
+	private static String getChildName(Object child) {
+		try {
+			return (String) MethodUtils.invokeMethod(child, "getName");
+		} catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
+			return child.toString();
+		}
 	}
 
 	@VisibleForTesting
